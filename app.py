@@ -122,6 +122,7 @@ st.sidebar.markdown("---")
 if st.sidebar.button("🗑️ Reset conversation"):
     st.session_state.chat_history = []
     st.session_state.last_figure = None
+    _last_figure = None
     st.rerun()
 
 st.sidebar.caption("API keys are used only for this session and are never stored or logged.")
@@ -146,8 +147,24 @@ def build_llm(provider: str, google_key: str, google_model: str, groq_key: str, 
 # ---------------------------------------------------------------------------
 # Step 5: Agent creation — tools + agent
 # ---------------------------------------------------------------------------
+# NOTE: LangChain/LangGraph may execute tool calls on a worker thread that
+# has no Streamlit "ScriptRunContext" attached, so st.session_state is NOT
+# safely readable from inside a @tool function (it raises "st.session_state
+# has no attribute ..."). We mirror the active dataframe / last figure into
+# plain module-level globals instead, which tools read/write directly. The
+# main script keeps these in sync with st.session_state before/after any
+# agent.invoke() call.
+_current_df = None
+_last_figure = None
+
+
+def set_current_df(df):
+    global _current_df
+    _current_df = df
+
+
 def _exec_namespace():
-    return {"pd": pd, "np": np, "plt": plt, "sns": sns, "df": st.session_state.df}
+    return {"pd": pd, "np": np, "plt": plt, "sns": sns, "df": _current_df}
 
 
 @tool
@@ -155,7 +172,7 @@ def get_dataframe_overview() -> str:
     """Return a text overview of the uploaded dataframe: shape, dtypes,
     missing value counts, sample rows, and summary statistics. Use this
     tool first to understand the dataset before writing analysis code."""
-    df = st.session_state.df
+    df = _current_df
     if df is None:
         return "No dataframe has been loaded yet."
     buf = io.StringIO()
@@ -178,7 +195,7 @@ def run_pandas_code(code: str) -> str:
     Assign your final answer to a variable named `result`. Do not read or
     write files, and do not import extra packages. Use this for computation
     only, not for plots (use create_visualization for plots)."""
-    if st.session_state.df is None:
+    if _current_df is None:
         return "No dataframe has been loaded yet."
     ns = _exec_namespace()
     stdout_capture = io.StringIO()
@@ -203,7 +220,8 @@ def create_visualization(code: str) -> str:
     `plt`, seaborn is `sns`. Build the plot with plt/sns calls; do not call
     plt.show(). The resulting figure is automatically captured and shown
     to the user."""
-    if st.session_state.df is None:
+    global _last_figure
+    if _current_df is None:
         return "No dataframe has been loaded yet."
     ns = _exec_namespace()
     try:
@@ -212,7 +230,7 @@ def create_visualization(code: str) -> str:
         fig = plt.gcf()
         if not fig.get_axes():
             return "No plot was created. Make sure to call a plotting function like plt.plot(...) or sns.barplot(...)."
-        st.session_state.last_figure = fig
+        _last_figure = fig
         return "Visualization created successfully and will be displayed to the user."
     except Exception as e:
         return f"Error creating visualization: {e}\n{traceback.format_exc(limit=2)}"
@@ -442,6 +460,7 @@ if uploaded_file is not None and uploaded_file.name != st.session_state.filename
 
 if st.session_state.df is not None:
     df = st.session_state.df
+    set_current_df(df)  # keep the tool-accessible global in sync each run
 
     with st.expander("🔍 Data Preview", expanded=True):
         st.dataframe(df.head(20), use_container_width=True)
@@ -525,7 +544,7 @@ if st.session_state.df is not None:
 
             try:
                 agent = get_agent()
-                st.session_state.last_figure = None
+                _last_figure = None  # reset the global scratch slot before this turn
                 with st.spinner("Thinking..."):
                     response = agent.invoke({
                         "messages": [
@@ -534,7 +553,8 @@ if st.session_state.df is not None:
                         ]
                     })
                 answer = extract_text(response)
-                fig = st.session_state.last_figure
+                fig = _last_figure  # populated by create_visualization, if it was called
+                st.session_state.last_figure = fig
                 with st.chat_message("assistant"):
                     st.markdown(answer)
                     if fig is not None:
