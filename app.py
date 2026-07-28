@@ -53,6 +53,13 @@ Guidelines:
   imported in the execution environment as pd, np, plt, sns) and the
   dataframe `df`. Do not import other packages, read/write files, or use
   the network.
+- If the user asks for a chart, plot, graph, visualization, or to "show" /
+  "plot" / "visualize" something, you MUST call the create_visualization
+  tool to actually render it. Never just describe what a chart would look
+  like in text instead of calling the tool.
+- In create_visualization code, always create the figure explicitly first,
+  e.g. `plt.figure(figsize=(8,5))`, then call the plotting function
+  (plt.*, sns.*, or df.plot), and call `plt.tight_layout()` at the end.
 - After using tools, answer the user in clear, concise natural language.
   Summarize numeric results instead of just dumping raw output.
 """
@@ -302,6 +309,180 @@ Duplicate rows: {report['duplicates']}
 
 
 # ---------------------------------------------------------------------------
+# Dashboard helpers (deterministic — no LLM involved, always renders)
+# ---------------------------------------------------------------------------
+def detect_column_types(df: pd.DataFrame):
+    """Split columns into numeric / categorical / datetime, including
+    object columns that look like dates on inspection of a sample."""
+    numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
+    categorical_cols = df.select_dtypes(include=["object", "category", "bool"]).columns.tolist()
+    datetime_cols = df.select_dtypes(include=["datetime64[ns]", "datetimetz"]).columns.tolist()
+
+    for col in list(categorical_cols):
+        sample = df[col].dropna().head(50)
+        if sample.empty:
+            continue
+        parsed = pd.to_datetime(sample, errors="coerce")
+        if parsed.notna().mean() > 0.8:
+            datetime_cols.append(col)
+            categorical_cols.remove(col)
+    return numeric_cols, categorical_cols, datetime_cols
+
+
+def render_overview_section(df, numeric_cols):
+    st.subheader("Describe")
+    st.dataframe(df.describe(include="all").T, use_container_width=True)
+
+    st.subheader("Correlation Matrix")
+    if len(numeric_cols) >= 2:
+        corr = df[numeric_cols].corr(numeric_only=True)
+        size = min(1 + len(numeric_cols) * 0.8, 12)
+        fig, ax = plt.subplots(figsize=(size, size * 0.85))
+        sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm", center=0, ax=ax)
+        plt.tight_layout()
+        st.pyplot(fig)
+    else:
+        st.info("Need at least 2 numeric columns to compute a correlation matrix.")
+
+
+def render_univariate_section(df, numeric_cols, categorical_cols):
+    col = st.selectbox("Select a column", df.columns.tolist(), key="univ_col")
+    c1, c2 = st.columns(2)
+
+    if col in numeric_cols:
+        with c1:
+            fig, ax = plt.subplots(figsize=(6, 4))
+            sns.histplot(df[col].dropna(), kde=True, ax=ax)
+            ax.set_title(f"Distribution of {col}")
+            plt.tight_layout()
+            st.pyplot(fig)
+        with c2:
+            fig, ax = plt.subplots(figsize=(6, 4))
+            sns.boxplot(x=df[col].dropna(), ax=ax)
+            ax.set_title(f"Boxplot of {col}")
+            plt.tight_layout()
+            st.pyplot(fig)
+        st.write(df[col].describe())
+    else:
+        top_n = st.slider("Top N categories", 3, 20, 10, key="univ_topn")
+        vc = df[col].value_counts().head(top_n)
+        with c1:
+            fig, ax = plt.subplots(figsize=(6, 4))
+            sns.barplot(x=vc.values, y=vc.index.astype(str), ax=ax, orient="h")
+            ax.set_title(f"Count plot of {col}")
+            ax.set_xlabel("Count")
+            plt.tight_layout()
+            st.pyplot(fig)
+        with c2:
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.pie(vc.values, labels=vc.index.astype(str), autopct="%1.1f%%", startangle=90)
+            ax.set_title(f"Share of {col}")
+            plt.tight_layout()
+            st.pyplot(fig)
+        st.write(vc)
+
+
+def render_bivariate_section(df, numeric_cols, categorical_cols):
+    cols = df.columns.tolist()
+    c1, c2 = st.columns(2)
+    x_col = c1.selectbox("X variable", cols, key="biv_x")
+    y_col = c2.selectbox("Y variable", cols, index=min(1, len(cols) - 1), key="biv_y")
+
+    if x_col in numeric_cols and y_col in numeric_cols:
+        fig, ax = plt.subplots(figsize=(7, 5))
+        sns.regplot(data=df, x=x_col, y=y_col, ax=ax, scatter_kws={"alpha": 0.5})
+        corr_val = df[[x_col, y_col]].corr().iloc[0, 1]
+        ax.set_title(f"{x_col} vs {y_col}  (corr = {corr_val:.2f})")
+        plt.tight_layout()
+        st.pyplot(fig)
+    elif (x_col in categorical_cols and y_col in numeric_cols) or (y_col in categorical_cols and x_col in numeric_cols):
+        cat_col, num_col = (x_col, y_col) if x_col in categorical_cols else (y_col, x_col)
+        top_cats = df[cat_col].value_counts().head(10).index
+        plot_df = df[df[cat_col].isin(top_cats)]
+        fig, ax = plt.subplots(figsize=(8, 5))
+        sns.boxplot(data=plot_df, x=cat_col, y=num_col, ax=ax)
+        ax.set_title(f"{num_col} by {cat_col}")
+        plt.xticks(rotation=45, ha="right")
+        plt.tight_layout()
+        st.pyplot(fig)
+    elif x_col in categorical_cols and y_col in categorical_cols:
+        ct = pd.crosstab(df[x_col], df[y_col])
+        fig, ax = plt.subplots(figsize=(8, 5))
+        sns.heatmap(ct, annot=True, fmt="d", cmap="Blues", ax=ax)
+        ax.set_title(f"{x_col} vs {y_col} (counts)")
+        plt.tight_layout()
+        st.pyplot(fig)
+    else:
+        st.info("Pick two different columns to compare.")
+
+
+def render_multivariate_section(df, numeric_cols, categorical_cols):
+    st.subheader("Pairplot")
+    default_sel = numeric_cols[: min(4, len(numeric_cols))]
+    selected = st.multiselect("Numeric columns (2–5 recommended)", numeric_cols, default=default_sel, key="mv_cols")
+    hue_col = st.selectbox("Optional hue (categorical)", ["None"] + categorical_cols, key="mv_hue")
+    if len(selected) >= 2:
+        if st.button("Generate Pairplot"):
+            with st.spinner("Generating pairplot..."):
+                hue = None if hue_col == "None" else hue_col
+                plot_cols = selected + ([hue] if hue else [])
+                g = sns.pairplot(df[plot_cols].dropna(), hue=hue)
+                st.pyplot(g.fig)
+    else:
+        st.info("Select at least 2 numeric columns.")
+
+    st.markdown("---")
+    st.subheader("Groupby Aggregation")
+    c1, c2, c3 = st.columns(3)
+    group_options = categorical_cols if categorical_cols else df.columns.tolist()
+    agg_options = numeric_cols if numeric_cols else df.columns.tolist()
+    group_col = c1.selectbox("Group by", group_options, key="gb_group")
+    agg_col = c2.selectbox("Aggregate column", agg_options, key="gb_agg")
+    agg_func = c3.selectbox("Aggregation", ["mean", "sum", "count", "median", "min", "max"], key="gb_func")
+    if group_col and agg_col:
+        grouped = df.groupby(group_col)[agg_col].agg(agg_func).sort_values(ascending=False).head(15)
+        fig, ax = plt.subplots(figsize=(8, 5))
+        sns.barplot(x=grouped.values, y=grouped.index.astype(str), ax=ax)
+        ax.set_title(f"{agg_func} of {agg_col} by {group_col}")
+        plt.tight_layout()
+        st.pyplot(fig)
+        st.dataframe(grouped)
+
+
+def render_timeseries_section(df, numeric_cols, datetime_cols):
+    if not datetime_cols:
+        st.info("No date/time-like column was detected in this dataset.")
+        return
+    if not numeric_cols:
+        st.info("No numeric column available to plot over time.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    date_col = c1.selectbox("Date column", datetime_cols, key="ts_date")
+    value_col = c2.selectbox("Value column", numeric_cols, key="ts_value")
+    freq = c3.selectbox("Resample frequency", ["D", "W", "M", "Q", "Y"], index=2, key="ts_freq")
+
+    ts_df = df[[date_col, value_col]].copy()
+    ts_df[date_col] = pd.to_datetime(ts_df[date_col], errors="coerce")
+    ts_df = ts_df.dropna(subset=[date_col]).set_index(date_col).sort_index()
+
+    if ts_df.empty:
+        st.warning("Could not parse any valid dates from that column.")
+        return
+
+    resampled = ts_df[value_col].resample(freq).sum()
+    rolling = resampled.rolling(window=3, min_periods=1).mean()
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    resampled.plot(ax=ax, marker="o", label=value_col)
+    rolling.plot(ax=ax, linestyle="--", label="Rolling mean (3)")
+    ax.set_title(f"{value_col} over time ({freq})")
+    ax.legend()
+    plt.tight_layout()
+    st.pyplot(fig)
+
+
+# ---------------------------------------------------------------------------
 # Step 6: App UI
 # ---------------------------------------------------------------------------
 st.title("📊 AI-Powered Data Analyst")
@@ -327,7 +508,9 @@ if st.session_state.df is not None:
     with st.expander("🔍 Data Preview", expanded=True):
         st.dataframe(df.head(20), use_container_width=True)
 
-    tab_eda, tab_chat = st.tabs(["📋 Automated EDA", "💬 Chat with your Data"])
+    tab_eda, tab_dash, tab_chat = st.tabs(
+        ["📋 Automated EDA", "📈 Visual Dashboard", "💬 Chat with your Data"]
+    )
 
     # ------------------------------------------------------------------ #
     # Tab 1: Automated EDA
@@ -379,7 +562,37 @@ if st.session_state.df is not None:
             st.info("Click **Run Automated EDA** to generate a full report.")
 
     # ------------------------------------------------------------------ #
-    # Tab 2: Chat
+    # Tab 2: Visual Dashboard (deterministic — always renders, no LLM)
+    # ------------------------------------------------------------------ #
+    with tab_dash:
+        numeric_cols, categorical_cols, datetime_cols = detect_column_types(df)
+
+        section = st.radio(
+            "Choose analysis type",
+            [
+                "Overview (Describe & Correlation)",
+                "Univariate",
+                "Bivariate",
+                "Multivariate & Groupby",
+                "Time Series",
+            ],
+            horizontal=True,
+        )
+        st.markdown("---")
+
+        if section == "Overview (Describe & Correlation)":
+            render_overview_section(df, numeric_cols)
+        elif section == "Univariate":
+            render_univariate_section(df, numeric_cols, categorical_cols)
+        elif section == "Bivariate":
+            render_bivariate_section(df, numeric_cols, categorical_cols)
+        elif section == "Multivariate & Groupby":
+            render_multivariate_section(df, numeric_cols, categorical_cols)
+        elif section == "Time Series":
+            render_timeseries_section(df, numeric_cols, datetime_cols)
+
+    # ------------------------------------------------------------------ #
+    # Tab 3: Chat
     # ------------------------------------------------------------------ #
     with tab_chat:
         for msg in st.session_state.chat_history:
