@@ -115,8 +115,8 @@ groq_api_key = st.sidebar.text_input(
     help="Required if using Groq. Get one at https://console.groq.com/keys",
 )
 
-gemini_model_name = st.sidebar.text_input("Gemini model", value="gemini-2.0-flash")
-groq_model_name = st.sidebar.text_input("Groq model", value="llama-3.3-70b-versatile")
+gemini_model_name = st.sidebar.text_input("Gemini model", value="gemini-3.5-flash-lite")
+groq_model_name = st.sidebar.text_input("Groq model", value="qwen/qwen3.6-27b")
 
 st.sidebar.markdown("---")
 if st.sidebar.button("🗑️ Reset conversation"):
